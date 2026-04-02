@@ -1,0 +1,179 @@
+model:
+  cldm:
+    target: diffbir.model.cldm.ControlLDM
+    params:
+      latent_scale_factor: 0.18215
+      unet_cfg:
+        use_checkpoint: True
+        image_size: 32 # unused
+        in_channels: 4
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_head_channels: 64 # need to fix for flash-attn
+        use_spatial_transformer: True
+        use_linear_in_transformer: True
+        transformer_depth: 1
+        context_dim: 1024
+        legacy: False
+      vae_cfg:
+        embed_dim: 4
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+          Adaptor_Flag: False
+          alpha: 1.0
+      clip_cfg:
+        embed_dim: 1024
+        vision_cfg:
+          image_size: 224
+          layers: 32
+          width: 1280
+          head_width: 80
+          patch_size: 14
+        text_cfg:
+          context_length: 77
+          vocab_size: 49408
+          width: 1024
+          heads: 16
+          layers: 24
+        layer: "penultimate"
+      controlnet_cfg:
+        use_checkpoint: True
+        image_size: 32 # unused
+        in_channels: 4
+        hint_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_head_channels: 64 # need to fix for flash-attn
+        use_spatial_transformer: True
+        use_linear_in_transformer: True
+        transformer_depth: 1
+        context_dim: 1024
+        legacy: False
+
+#  swinir:
+#    target: diffbir.model.swinir.SwinIR
+#    params:
+#      img_size: 64
+#      patch_size: 1
+#      in_chans: 3
+#      embed_dim: 180
+#      depths: [6, 6, 6, 6, 6, 6, 6, 6]
+#      num_heads: [6, 6, 6, 6, 6, 6, 6, 6]
+#      window_size: 8
+#      mlp_ratio: 2
+#      sf: 8
+#      img_range: 1.0
+#      upsampler: "nearest+conv"
+#      resi_connection: "1conv"
+#      unshuffle: True
+#      unshuffle_scale: 8
+
+  diffusion:
+    target: diffbir.model.gaussian_diffusion.Diffusion
+    params:
+      linear_start: 0.00085
+      linear_end: 0.0120
+      timesteps: 1000
+      zero_snr: True #False
+      parameterization: v #eps
+
+dataset:
+  train:
+    target: diffbir.dataset.codeformer.CodeformerDataset
+    params:
+      # training file list path
+      file_gt: /media/xjtu-ei/Disk_8T/LJH/Datasets/Natura_datasets/Div2K_Flick2K_train_Size_512_640_800 # /media/xjtu-ei/Disk_8T/LJH/Datasets/Natura_datasets/open-images-5W_crop_640  #Flickr2K_HR  #DIV2K_train_HR  #/usr/mlkkIC/Natura_datasets/open-images-30W_crop_256
+      file_lq: /media/xjtu-ei/Disk_8T/LJH/LIC/LIC_TCM-main/results_test/Div2K_Flick2K_train_Size_512_640_800_0.0015  #/media/xjtu-ei/Disk_8T/LJH/Datasets/Natura_datasets/LQ_dataset/open-images-5W_crop_640_TCM/0005checkpoint_best  # /usr/mlkkIC/Natura_datasets/open-images-5W_crop_640  #Flickr2K_HR #/usr/mlkkIC/Natura_datasets/LQ_dataset/DIV2K_train_HR_LIC_TCM/0025  #/usr/mlkkIC/Natura_datasets/LQ_dataset/open-images-30W_crop_256_TCM_0025/0025
+      file_backend_cfg:
+        target: diffbir.dataset.file_backend.HardDiskBackend
+      out_size: 512
+      crop_type: random #center
+      random_flag: True
+      Target_training: True  #  True  使用真实的数据， False 使用产生的降质图像
+      blur_kernel_size: 41
+      kernel_list: ['iso', 'aniso']
+      kernel_prob: [0.5, 0.5]
+      blur_sigma: [0.1, 12]
+      downsample_range: [1, 12]
+      noise_range: [0, 5] #[0, 15]
+      jpeg_range: [30, 100]
+
+
+batch_transform:
+  target: diffbir.dataset.batch_transform.IdentityBatchTransform
+
+train:
+  # pretrained sd v2.1 path
+  sd_path: ./weights/v2-1_512-ema-pruned.ckpt
+  # experiment directory path
+  exp_dir: ./experiment_0.0005_wo_llpips_w_DSM #_wo_DSM
+  # stage 1 swinir path.
+  # In our paper, we use SwinIR trained on ImageNet-1k with codeformer degradation.
+  swinir_path: 
+  learning_rate: 5e-5 #1e-4
+  # ImageNet 1k (1.3M images)
+  # batch size = 192, lr = 1e-4, total training steps = 25k
+  # Our filtered laion2b-en (15M images)
+  # batch size = 256, lr = 1e-4 (first 30k), 1e-5 (next 50k), total training steps = 80k
+  coef_con: 2e-1
+  batch_size: 8 #32 #256
+  num_workers: 4
+  train_steps: 500000
+  log_every: 50
+  ckpt_every: 2000  #10000
+  image_every: 500 #500
+#  resume: /media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment/checkpoints/0280000.pt
+#  resume: /media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.0005/checkpoints/0280000.pt
+#  resume: /media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.0005_wo_llpips_w_DSM/checkpoints/0300000.pt
+#  resume: /media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.00025/checkpoints/0294000.pt
+  resume: /media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.001/checkpoints/0294000.pt
+#  resume: /media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.00015/checkpoints/0308000.pt
+#  resume: /media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.00015_wo_llpips/checkpoints/0336000.pt
+  noise_aug_timestep: 0
+
+llpips:
+  target: latent_lpips.lpips.LPIPS
+  ckpt_path: weights/vgg16_sdturbo_lpips.pth
+  compile: False
+  coef: 0.0 # default  1.0
+  params:
+    pretrained: False
+    net: vgg16
+    lpips: True
+    spatial: False
+    pnet_rand: False
+    pnet_tune: True
+    use_dropout: True
+    eval_mode: True
+    latent: True
+    in_chans: 4
+    verbose: True
+
+
+Gan_train:
+  lr: 1e-5                      # learning rate
+  weight_decay: 0
+  net_g_start_iter: 10000
+  net_d_circle_iter: 1
+  scale_adaptive_gan_weight: 0.001 #0.8
+  loss_en_coef: [1, 0.0001] #[120, 0] ## MSE  LPIPS
+  ckpt_path: ./experiment/checkpoints/net_d_0240000.pth  # Discriminator
+  Gan_enable: False #True

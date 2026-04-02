@@ -1,0 +1,437 @@
+from argparse import ArgumentParser, Namespace
+
+import torch
+
+from accelerate.utils import set_seed
+from diffbir.inference import (
+    BSRInferenceLoop,
+    BFRInferenceLoop,
+    BIDInferenceLoop,
+    UnAlignedBFRInferenceLoop,
+    CustomInferenceLoop,
+)
+import numpy as np
+import math
+from time import time
+def check_device(device: str) -> str:
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            print(
+                "CUDA not available because the current PyTorch install was not "
+                "built with CUDA enabled."
+            )
+            device = "cpu"
+    else:
+        if device == "mps":
+            if not torch.backends.mps.is_available():
+                if not torch.backends.mps.is_built():
+                    print(
+                        "MPS not available because the current PyTorch install was not "
+                        "built with MPS enabled."
+                    )
+                    device = "cpu"
+                else:
+                    print(
+                        "MPS not available because the current MacOS version is not 12.3+ "
+                        "and/or you do not have an MPS-enabled device on this machine."
+                    )
+                    device = "cpu"
+    print(f"using device {device}")
+    return device
+
+
+DEFAULT_POS_PROMPT = (
+    "Cinematic, High Contrast, highly detailed, taken using a Canon EOS R camera, "
+    "hyper detailed photo - realistic maximum detail, 32k, Color Grading, ultra HD, extreme meticulous detailing, "
+    "skin pore detailing, hyper sharpness, perfect without deformations."
+)
+
+DEFAULT_NEG_PROMPT = (
+    "painting, oil painting, illustration, drawing, art, sketch, oil painting, cartoon, "
+    "CG Style, 3D render, unreal engine, blurring, dirty, messy, worst quality, low quality, frames, watermark, "
+    "signature, jpeg artifacts, deformed, lowres, over-smooth."
+)
+
+
+def parse_args() -> Namespace:
+    parser = ArgumentParser()
+    # model parameters
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="sr",
+        choices=["sr", "face", "denoise", "unaligned_face"],
+        help="Task you want to do. Ignore this option if you are using self-trained model.",
+    )
+
+    parser.add_argument(
+        "--version",
+        type=str,
+        default="v2.1",
+        choices=["v1", "v2", "v2.1", "custom"],
+        help="DiffBIR model version.",
+    )
+    parser.add_argument(
+        "--train_cfg",
+        type=str,
+        default="",
+        help="Path to training config. Only works when version is custom.",
+    )
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default="",
+        help="Path to saved checkpoint. Only works when version is custom.",
+    )
+    # sampling parameters
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        default="edm_dpm++_3m_sde",
+        choices=[
+            "dpm++_m2",
+            "spaced",
+            "ddim",
+            "edm_euler",
+            "edm_euler_a",
+            "edm_heun",
+            "edm_dpm_2",
+            "edm_dpm_2_a",
+            "edm_lms",
+            "edm_dpm++_2s_a",
+            "edm_dpm++_sde",
+            "edm_dpm++_2m",
+            "edm_dpm++_2m_sde",
+            "edm_dpm++_3m_sde",
+        ],
+        help="Sampler type. Different samplers may produce very different samples.",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=10,
+        help="Sampling steps. More steps, more details.",
+    )
+    parser.add_argument(
+        "--start_point_type",
+        type=str,
+        choices=["noise", "cond"],
+        default="noise",
+        help=(
+            "For DiffBIR v1 and v2, setting the start point types to 'cond' can make the results much more stable "
+            "and ensure that the outcomes from ODE samplers like DDIM and DPMS are normal. "
+            "However, this adjustment may lead to a decrease in sample quality."
+        ),
+    )
+    parser.add_argument(
+        "--cleaner_tiled",
+        action="store_true",
+        help="Enable tiled inference for stage-1 model, which reduces the GPU memory usage.",
+    )
+    parser.add_argument(
+        "--cleaner_tile_size", type=int, default=512, help="Size of each tile."
+    )
+    parser.add_argument(
+        "--cleaner_tile_stride", type=int, default=256, help="Stride between tiles."
+    )
+    parser.add_argument(
+        "--vae_encoder_tiled",
+        action="store_true",
+        help="Enable tiled inference for AE encoder, which reduces the GPU memory usage.",
+    )
+    parser.add_argument(
+        "--vae_encoder_tile_size", type=int, default=256, help="Size of each tile."
+    )
+    parser.add_argument(
+        "--vae_decoder_tiled",
+        action="store_true",
+        help="Enable tiled inference for AE decoder, which reduces the GPU memory usage.",
+    )
+    parser.add_argument(
+        "--vae_decoder_tile_size", type=int, default=256, help="Size of each tile."
+    )
+    parser.add_argument(
+        "--cldm_tiled",
+        action="store_true",
+        help="Enable tiled sampling, which reduces the GPU memory usage.",
+    )
+    parser.add_argument(
+        "--cldm_tile_size", type=int, default=512, help="Size of each tile."
+    )
+    parser.add_argument(
+        "--cldm_tile_stride", type=int, default=256, help="Stride between tiles."
+    )
+
+    parser.add_argument(
+        "--pos_prompt",
+        type=str,
+        default=DEFAULT_POS_PROMPT,
+        help=(
+            "Descriptive words for 'good image quality'. "
+            "It can also describe the things you WANT to appear in the image."
+        ),
+    )
+    parser.add_argument(
+        "--neg_prompt",
+        type=str,
+        default=DEFAULT_NEG_PROMPT,
+        help=(
+            "Descriptive words for 'bad image quality'. "
+            "It can also describe the things you DON'T WANT to appear in the image."
+        ),
+    )
+    parser.add_argument(
+        "--cfg_scale", type=float, default=6.0, help="Classifier-free guidance scale."
+    )
+    parser.add_argument(
+        "--rescale_cfg",
+        action="store_true",
+        help="Gradually increase cfg scale from 1 to ('cfg_scale' + 1)",
+    )
+    parser.add_argument(
+        "--noise_aug",
+        type=int,
+        default=0,
+        help="Level of noise augmentation. More noise, more creative.",
+    )
+    parser.add_argument(
+        "--s_churn",
+        type=float,
+        default=0,
+        help="Randomness in sampling. Only works with some edm samplers.",
+    )
+    parser.add_argument(
+        "--s_tmin",
+        type=float,
+        default=0,
+        help="Minimum sigma for adding ramdomness to sampling. Only works with some edm samplers.",
+    )
+    parser.add_argument(
+        "--s_tmax",
+        type=float,
+        default=300,
+        help="Maximum  sigma for adding ramdomness to sampling. Only works with some edm samplers.",
+    )
+    parser.add_argument(
+        "--s_noise",
+        type=float,
+        default=1,
+        help="Randomness in sampling. Only works with some edm samplers.",
+    )
+    parser.add_argument(
+        "--eta",
+        type=float,
+        default=1,
+        help="I don't understand this parameter. Leave it as default.",
+    )
+    parser.add_argument(
+        "--order",
+        type=int,
+        default=1,
+        help="Order of solver. Only works with edm_lms sampler.",
+    )
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=1,
+        help="Control strength from ControlNet. Less strength, more creative.",
+    )
+    parser.add_argument("--batch_size", type=int, default=1, help="Nothing to say.")
+    # guidance parameters
+    parser.add_argument(
+        "--guidance", action="store_true", help="Enable restoration guidance."
+    )
+    parser.add_argument(
+        "--g_loss",
+        type=str,
+        default="w_mse",
+        choices=["mse", "w_mse"],
+        help="Loss function of restoration guidance.",
+    )
+    parser.add_argument(
+        "--g_scale",
+        type=float,
+        default=0.0,
+        help="Learning rate of optimizing the guidance loss function.",
+    )
+    # common parameters
+
+    parser.add_argument(
+        "--n_samples", type=int, default=1, help="Number of samples for each image."
+    )
+
+    parser.add_argument(
+        "--output", type=str, default="./results_tmp/", help="output the reconstructed images."
+    )
+
+    parser.add_argument("--seed", type=int, default=231)
+    parser.add_argument("--lamb", type=float, default=0.0015)
+    # mps has not been tested
+    parser.add_argument(
+        "--device", type=str, default="cuda", choices=["cpu", "cuda", "mps"]
+    )
+    parser.add_argument(
+        "--precision", type=str, default="fp16", choices=["fp32", "fp16", "bf16"]
+    )
+    parser.add_argument("--llava_bit", type=str, default="4", choices=["16", "8", "4"])
+
+    parser.add_argument("--config", type=str, required=True)
+
+    return parser.parse_args()
+
+def calculate_psnr(img1, img2):
+    # img1 and img2 have range [0, 255]
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    mse = np.mean((img1 - img2)**2)
+    if mse == 0:
+        return float('inf')
+    return 20 * math.log10(255.0 / math.sqrt(mse))
+
+def main():
+    import os
+    from omegaconf import OmegaConf
+    from diffbir.model import ControlLDM,  Diffusion
+    from torch.utils.data import DataLoader
+    from diffbir.sampler import SpacedSampler
+    from accelerate import Accelerator
+    from einops import rearrange
+    from diffbir.utils.common import instantiate_from_config, to
+    from torchvision.utils import save_image
+
+    args = parse_args()
+
+    args.device = check_device(args.device)
+    set_seed(args.seed)
+
+    accelerator = Accelerator(split_batches=True)
+    set_seed(231, device_specific=True)
+    device = accelerator.device
+
+    cfg = OmegaConf.load(args.config)
+    diffusion: Diffusion = instantiate_from_config(cfg.model.diffusion)
+
+    # Create model:
+    cldm: ControlLDM = instantiate_from_config(cfg.model.cldm)
+    sd = torch.load(cfg.test.sd_path, map_location="cpu")["state_dict"]
+    unused, missing = cldm.load_pretrained_sd(sd)
+    if 1:
+        print(
+            f"strictly load pretrained SD weight from {cfg.test.sd_path}\n"
+            f"unused weights: {unused}\n"
+            f"missing weights: {missing}"
+        )
+
+    if args.lamb in [0.00015, 0.00025,  0.0005, 0.001, 0.0015]:
+        if args.lamb == 0.00015:
+            cfg.test.controlnet_ckpt="/media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.00015_wo_llpips_wo_DSM/checkpoints/0364000.pt"
+        elif args.lamb == 0.00025:
+            cfg.test.controlnet_ckpt="/media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.00025_wo_llpips_wo_DSM/checkpoints/0330000.pt"
+        elif args.lamb == 0.0005:
+            cfg.test.controlnet_ckpt="/media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.0005_wo_llpips_wo_DSM/checkpoints/0298000.pt"
+        elif args.lamb == 0.001:
+            cfg.test.controlnet_ckpt="/media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.001_wo_llpips_wo_DSM/checkpoints/0330000.pt"
+        elif args.lamb == 0.0015:
+            cfg.test.controlnet_ckpt = "/media/xjtu-ei/Disk_8T/LJH/Compression_mlkk/img_recover/DiffBIR-main/experiment_0.0015_wo_llpips_wo_DSM/checkpoints/0334000.pt"
+
+    if cfg.test.controlnet_ckpt:
+        checkpoint = torch.load(cfg.test.controlnet_ckpt, map_location="cpu")
+        if 'model_state_dict' in checkpoint:
+            cldm.load_controlnet_from_ckpt(checkpoint['model_state_dict'])
+        else:
+            cldm.load_controlnet_from_ckpt(checkpoint)
+        print(
+            f"load controlnet weight from checkpoint: {cfg.test.controlnet_ckpt}"
+        )
+
+
+
+    # Setup data:
+    dataset = instantiate_from_config(cfg.dataset.test)
+    loader = DataLoader(
+        dataset=dataset,
+        batch_size=1,
+        num_workers=4,
+        shuffle=False,
+        drop_last=False,
+        pin_memory=True,
+    )
+    if 1:
+        print(f"Dataset contains {len(dataset):,} images")
+
+    batch_transform = instantiate_from_config(cfg.batch_transform)
+
+    cldm.eval().to(device) #cuda()
+    diffusion.to(device)  #.cuda()
+    # Setup optimizer:
+    # opt = torch.optim.AdamW(cldm.controlnet.parameters(), lr=cfg.test.learning_rate)
+    cldm, loader = accelerator.prepare(cldm, loader)
+    pure_cldm: ControlLDM = accelerator.unwrap_model(cldm)
+
+    sampler = SpacedSampler(
+        diffusion.betas, diffusion.parameterization, rescale_cfg=False
+    )
+    # save_path = cfg.test.output
+    save_path = args.output
+    os.makedirs(save_path, exist_ok=True)
+    PSNR_List = []
+    time_list =[]
+    for batch in loader:
+        to(batch, device)
+        batch = batch_transform(batch)
+        gt, lq, img_name = batch
+        gt = rearrange(gt, "b h w c -> b c h w").contiguous().float()
+        lq = rearrange(lq, "b h w c -> b c h w").contiguous().float()
+
+        with torch.no_grad():
+
+
+            z_0 = pure_cldm.vae_encode(gt)
+            log_gt, log_lq = gt[:], lq[:]
+
+            start_time = time()
+            cond = pure_cldm.prepare_condition(lq)
+            log_cond = {k: v[:] for k, v in cond.items()}
+            # log_prompt = prompt[:]
+            with torch.no_grad():
+                z = sampler.sample(
+                    model=cldm,
+                    device=device,
+                    steps=50,
+                    x_size=(len(log_gt), *z_0.shape[1:]),
+                    cond=log_cond,
+                    uncond=None,
+                    cfg_scale=1.0,
+                    progress=accelerator.is_main_process,
+                )
+                sample = (pure_cldm.vae_decode(z) + 1) / 2
+                sample = torch.clamp(sample, 0, 1)
+
+                end_time = time()
+                time_list.append(end_time-start_time)
+
+
+
+                lq_img = log_lq
+                gt_img = (log_gt + 1)/ 2
+                lq_img = torch.clamp(lq_img, 0, 1)
+                gt_img = torch.clamp(gt_img, 0, 1)
+
+                PSNR = calculate_psnr((sample * 255.0).cpu().numpy(), (gt_img * 255.0).cpu().numpy())
+                PSNR_List.append(PSNR)
+                # 生成保存路径
+                sample_path = os.path.join(save_path, f"{img_name[0]}.png")
+                # lq_img_path = os.path.join(save_path, f"{img_name[0]}_lq.png")
+                # gt_img_path = os.path.join(save_path, f"{img_name[0]}_gt.png")
+
+                # 保存图像
+                save_image(sample, sample_path)
+                # save_image(lq_img, lq_img_path)
+                # save_image(gt_img, gt_img_path)
+
+    print(f"Enjoy the results in {save_path}! The Average PSNR is {np.mean(PSNR_List)} !")
+    print(f"Avg time {np.mean(time_list)}")
+
+
+if __name__ == "__main__":
+    main()
